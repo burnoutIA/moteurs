@@ -178,8 +178,16 @@ rester vide, parce que même `none` réfléchit un peu avant de répondre.
    tokenizer, flux SSE, outils, marqueurs de raisonnement) : la reprendre du serveur Strata, ou
    l'écrire.
 4. Mesurer avec `profil-decodage` adapté, puis le banc Harn.
-5. Brancher dans Harn : compilation dans la bulle après accord, et comparaison au banc avec le
-   mélange llama.cpp.
+5. Brancher dans Harn. Le code est écrit (21/11), il reste l'installation et le banc.
+   - fiche `inkling-2-mini-ink2` (`engine: 'ink2'`), avec 4 fichiers du checkpoint officiel aux
+     empreintes figées ;
+   - `installInk2` (src/runtimes.mjs) : archive de ce dépôt à un commit figé (`INK2.commit`),
+     `build.sh` dans la bulle (ROCm de Harn en lecture, le seul dossier `inkling2/` en écriture),
+     puis un venv uv avec tokenizers et jinja2 ;
+   - lancement (src/loading.mjs) : `serveur.py` sur le port 4755, avec la clé du moteur de Harn
+     et l'id Harn comme alias ;
+   - banc : le moteur sans spéculation et avec `--spec`, le meilleur des deux à 128k.
+   Pour monter de version : pousser ici, puis changer `INK2.commit` dans Harn.
 
 ## Journal
 
