@@ -200,3 +200,9 @@ rester vide, parce que même `none` réfléchit un peu avant de répondre.
 - **21/11, soir** : validation contre llama.cpp (divergences toutes sur des quasi-égalités) ;
   façade OpenAI écrite et testée (outils, flux, coupure) ; 131k de contexte dans 21,4 Gio, à
   ~67 tok/s.
+- **21/11, 17 h** : installé par Harn (fiche `inkling-2-mini-ink2`, compilé dans la bulle en
+  ~10 s). Banc Harn : **64,2 tok/s** (code 63,8, texte 65,4), 57,4 à ~35k de contexte,
+  préremplissage à 574 tok/s. Avec le drafter (`--spec`), 59,2 : il coûte plus qu'il ne
+  rapporte, et Harn garde le moteur sans. **QI 120** (llama.cpp UD-Q4_K_XL : 115). Outils,
+  raisonnement et contexte à 125, code 121, honnêteté 83 : le modèle invente encore une
+  rencontre entre Jean Valjean et d'Artagnan.
