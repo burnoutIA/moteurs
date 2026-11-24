@@ -1,8 +1,8 @@
 # LFM3 1.7B (QAD Q4_0) : fiche du moteur sur mesure
 
-Dernière mise à jour : 24 novembre 2026. État : **moteur écrit et validé, API OpenAI**, HIP (R9700) et
-CUDA (RTX 3090). Décodage +24 à +44 % sur llama.cpp, préremplissage devant sur la R9700. Pas encore
-branché dans Harn. Aucun moteur sur mesure n'existait pour LFM3 (ni Strata, ni ailleurs) : écrit de zéro.
+Dernière mise à jour : 24 novembre 2026. État : **moteur écrit et validé, API OpenAI, branché dans Harn**, HIP (R9700) et
+CUDA (RTX 3090). Décodage +24 à +44 % sur llama.cpp, préremplissage devant sur la R9700.
+Aucun moteur sur mesure n'existait pour LFM3 (ni Strata, ni ailleurs) : écrit de zéro.
 
 ## Sources
 
@@ -127,10 +127,25 @@ Piège de mesure : sur la R9700, la mémoire est au repos à 96 MHz ; un prérem
 finir avant que les fréquences montent (mesures bimodales, 13k ou 19k). `LFM3_REPEAT=N` refait le
 préremplissage N fois et garde le meilleur.
 
+### Dans Harn (24/11)
+
+Fiche `lfm3-1-7b-qad-lfm3` (`engine: 'lfm3'`) : Harn télécharge ce dépôt au commit figé, compile
+`lfm3/` dans la bulle (HIP avec le ROCm de Harn, ou nvcc), et lance la façade sur le port 4756. Le GGUF
+d'une fiche llama.cpp déjà installée est repris sans téléchargement.
+
+| | R9700 : llama.cpp (fiche Q4_0, n-gramme) | R9700 : nous | 3090 : llama.cpp (n-gramme) | 3090 : nous |
+|---|---|---|---|---|
+| Banc, ~4k (code + prose) | 237 tok/s | **371** | 307 | **474** |
+| Banc, 30k de prompt | 262 | 268 | 299 | **387** |
+| Test d'intelligence | 76 (207 s) | **80** (157 s) | 69 (144 s) | **72** (113 s) |
+
+À 30k sur la R9700, l'avance tombe : l'attention du décodage lit le cache KV f16 des 6 couches
+globales, et llama.cpp gagne avec le n-gramme sur ce texte qui se répète.
+
 ### Reste
 
-1. Brancher dans Harn (fiche à part, comme `inkling-2-mini-ink2`), banc et test d'intelligence.
+1. Décodage en contexte long sur la R9700 (30k : à égalité avec llama.cpp + n-gramme) : cache KV q8
+   (la moitié des octets lus au décodage) et spéculation n-gramme dans le moteur.
 2. Échantillonnage sur la carte (top-k), pour ne plus copier 512 Ko de logits par token.
 3. 3090, préremplissage long : produits en int8 sur les tensor cores (llama.cpp : MMQ, deux fois le débit
    du fp16) et une attention mieux réglée pour Ampere.
-4. Cache KV en q8 pour les longs contextes (la moitié des octets lus au décodage).
