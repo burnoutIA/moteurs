@@ -13,6 +13,7 @@ sans fiche à jour est un moteur perdu.**
 | Modèle | Fiche | État |
 |---|---|---|
 | Inkling 2 Mini | [inkling-2-mini.md](inkling-2-mini.md) | validé, API OpenAI ; RTX 3090 94 tok/s (llama.cpp 54), R9700 68 tok/s (llama.cpp 33) |
+| LFM3 1.7B (QAD Q4_0) | [lfm3-1.7b.md](lfm3-1.7b.md) | validé, API OpenAI ; écrit de zéro ; R9700 ~395 tok/s (llama.cpp 279), RTX 3090 514 (366) |
 
 ## 1. Décider : le moteur général est-il vraiment le goulot ?
 
