@@ -56,12 +56,16 @@ curl http://127.0.0.1:4799/v1/chat/completions -H 'Content-Type: application/jso
 
 L'API gère le flux SSE, les appels d'outils, le raisonnement séparé (`reasoning_content`), et
 l'effort de raisonnement (`none` à `max`). Elle garde le cache du prompt d'un tour à l'autre.
+Images (URL `data:`, comme pi et la plupart des clients les envoient) : `ROCM=/opt/rocm ./build-vision.sh` compile l'encodeur
+(llama.cpp figé, ~5 min), et `lancer.sh` l'ajoute dès que `poids/mmproj-BF16.gguf` est là (téléchargé avec les poids).
 Option `--spec` : le drafter MTP du modèle, utile en contexte court et contre-productif sur les
 longs prompts.
 
 ## Limites
 
-- Pas de vision : le moteur ne lit que le texte.
+- Vision : l'encodeur en HIP sur Radeon ; sur NVIDIA, `VISION_BACKEND=cpu ./build-vision.sh` le met sur le processeur
+  (la 3090 garde sa mémoire pour 131k) : ~1 s pour une image de 640 px, 5 s au plafond de 1 024 vecteurs.
+  Pas de WebP (llama.cpp le lit par ffmpeg, non compilé ici).
 - Une requête à la fois.
 - Pas de version allégée : le moteur lit le checkpoint officiel, pas les GGUF quantifiés.
 - Préremplissage plus lent que llama.cpp (calcul en fp32 strict).
@@ -74,6 +78,7 @@ longs prompts.
 | `inkling2/amont/` | sources CUDA d'origine de `strata-ink2`, inchangées (Strata, commit `5050dca`) |
 | `inkling2/src/ink2_engine.hip` | le portage HIP pour RDNA4 |
 | `inkling2/outils/serveur.py` | l'API compatible OpenAI devant le moteur |
+| `inkling2/vision/` | l'encodeur d'image (outil sur la `libmtmd` de llama.cpp, et son correctif d'une ligne) |
 | `inkling-2-mini.md` | architecture, mesures, choix du portage, validation, pièges |
 | [METHODE.md](METHODE.md) | quand un moteur sur mesure vaut la peine, et comment s'y prendre |
 | `outils/profil-decodage.sh` | profil du décodage sur AMD (noyaux par token, temps de calcul) |

@@ -2,6 +2,7 @@
 #
 #   .venv/bin/python -I outils/serveur.py --model poids --engine build/strata-ink2 [--port 4799] [--ctx 131072]
 #                                         [--spec] [--kv f16|i8r] [--api-key-file F] [--alias NOM]
+#                                         [--vision build/inkling2-vision --mmproj poids/mmproj-BF16.gguf]
 #
 # Le moteur tourne en --serve, protocole par lignes de Strata : on lui envoie « GEN <max> k=v… <ids> », il répond
 # « PP … » pendant le préremplissage, « T <id> » par token, puis « DONE <gen> <prompt> <prompt_ms> <decode_ms> <fin> » ;
@@ -11,7 +12,13 @@
 # Réponse d'Inkling : des messages <|message_model|>[NOM]<|content_KIND|>CORPS<|end_message|>, KIND valant thinking
 # (-> reasoning_content), text (-> content) ou invoke_tool_json (CORPS = {"name":…, "args":{…}} -> tool_calls), puis
 # <|content_model_end_sampling|>. Une seule requête à la fois (le moteur n'a qu'un fil) : les autres attendent.
-import argparse, json, re, subprocess, sys, threading, time, uuid
+#
+# Images (avec --vision et --mmproj) : le gabarit officiel met <|content_image|><|unused_200054|><|end_message|> à
+# la place de chaque image. inkling2-vision (l'encodeur de llama.cpp, seul) en tire N vecteurs, un par carré de
+# 40 x 40 pixels ; « IMG <fichier> » les donne au moteur, qui répond « IMG <premier id> <N> », et ces N ids
+# remplacent le token. Une image déjà vue (même SHA-256) garde ses ids : le cache du prompt la reconnaît.
+# Seules les URL data: sont acceptées (pas de téléchargement par la façade).
+import argparse, base64, hashlib, json, os, re, subprocess, sys, tempfile, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import jinja2, jinja2.ext
@@ -21,6 +28,9 @@ from tokenizers import Tokenizer
 HEAD, THINK, TEXT, CALL = "<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>"
 END, STOP = "<|end_message|>", "<|content_model_end_sampling|>"
 EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+IMAGE_TOKEN = "<|unused_200054|>"
+IMAGE_TYPES = ("image", "input_image", "image_url")
+IMG_ROWS_MAX = 100_000   # vecteurs d'image gardés par le moteur (~0,9 Go de mémoire vive) avant un IMGRESET
 
 
 class GenerationTag(jinja2.ext.Extension):
@@ -59,17 +69,114 @@ class Model:
             sys.exit(f"le moteur n'a pas démarré : {line}")
         self.ctx = int(line[1])
         self.lock = threading.Lock()
+        self.image_id = self.tok.token_to_id(IMAGE_TOKEN)
+        self.images, self.img_rows, self.vision = {}, 0, None   # SHA-256 -> (premier id, N)
+        if a.vision and a.mmproj:
+            cmd = [a.vision, "--mmproj", a.mmproj, "--serve"]
+            if a.image_max_tokens:
+                cmd += ["--max-tokens", str(a.image_max_tokens)]
+            self.vision = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                           text=True, bufsize=1)
+            if self.vision.stdout.readline().strip() != "READY":
+                sys.exit("l'encodeur d'image n'a pas démarré")
+            self.tmp = tempfile.mkdtemp(prefix="inkling2-images-")
+
+    # --- images ---
+    def image_bytes(self, p):
+        src = p.get("image_url", p.get("image"))
+        if isinstance(src, dict):
+            src = src.get("url")
+        if not isinstance(src, str) or not src.startswith("data:"):
+            raise BadRequest("image : seule une URL data: (base64) est acceptée")
+        head, _, body = src.partition(",")
+        if ";base64" not in head:
+            raise BadRequest("image : URL data: attendue en base64")
+        try:
+            return base64.b64decode(body, validate=False)
+        except ValueError:
+            raise BadRequest("image : base64 illisible")
+
+    def image_ids(self, data):
+        """Les ids que le moteur a donnés à cette image (encodée et chargée la première fois). Sous self.lock."""
+        h = hashlib.sha256(data).hexdigest()
+        if h in self.images:
+            return self.images[h]
+        src, out = os.path.join(self.tmp, h), os.path.join(self.tmp, h + ".inkv")
+        with open(src, "wb") as f:
+            f.write(data)
+        try:
+            self.vision.stdin.write(f"{src}\t{out}\n")
+            self.vision.stdin.flush()
+            r = self.vision.stdout.readline().split(maxsplit=1)
+            if not r:
+                raise RuntimeError("l'encodeur d'image s'est arrêté")
+            if r[0] != "OK":
+                raise BadRequest(f"image refusée : {r[1].strip() if len(r) > 1 else '?'}")
+            n = int(r[1].split()[0])
+            if self.img_rows + n > IMG_ROWS_MAX:   # le moteur oublie toutes les images, et son cache avec
+                self.proc.stdin.write("IMGRESET\n")
+                self.proc.stdin.flush()
+                if self.proc.stdout.readline().strip() != "IMGRESET":
+                    raise RuntimeError("le moteur n'a pas oublié les images")
+                self.images, self.img_rows = {}, 0
+            self.proc.stdin.write(f"IMG {out}\n")
+            self.proc.stdin.flush()
+            f = self.proc.stdout.readline().split()
+            if not f or f[0] != "IMG":
+                raise RuntimeError(f"le moteur a refusé l'image : {' '.join(f)}")
+            first, n = int(f[1]), int(f[2])
+        finally:
+            for x in (src, out):
+                if os.path.exists(x):
+                    os.remove(x)
+        self.images[h] = (first, n)
+        self.img_rows += n
+        return first, n
+
+    def expand(self, ids, images):
+        """Chaque <|unused_200054|> du prompt devient les ids des vecteurs de son image. Sous self.lock."""
+        if not images:
+            return ids
+        out, k = [], 0
+        for t in ids:
+            if t == self.image_id:
+                if k >= len(images):
+                    raise BadRequest("plus de tokens image que d'images")
+                first, n = self.image_ids(images[k])
+                out.extend(range(first, first + n))
+                k += 1
+            else:
+                out.append(t)
+        if k != len(images):
+            raise BadRequest(f"{len(images)} images, {k} places dans le prompt")
+        return out
 
     # --- prompt ---
     def prompt(self, req):
-        messages = []
+        """(ids, images) : les ids du gabarit, un <|unused_200054|> par image, et les octets des images dans l'ordre."""
+        messages, images = [], []
         for m in req.get("messages") or []:
             role = m.get("role")
             if role == "developer":
                 role = "system"
             out = {"role": role}
             c = m.get("content")
-            if isinstance(c, list):
+            if isinstance(c, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_TYPES for p in c):
+                if not self.vision:
+                    raise BadRequest("images : lancer la façade avec --vision et --mmproj")
+                parts = []   # le gabarit rend chaque morceau dans son propre bloc, l'image à sa place
+                for p in c:
+                    if isinstance(p, str):
+                        parts.append({"type": "text", "text": p})
+                    elif p.get("type") in ("text", "input_text"):
+                        parts.append({"type": "text", "text": p.get("text") or ""})
+                    elif p.get("type") in IMAGE_TYPES:
+                        images.append(self.image_bytes(p))
+                        parts.append({"type": "image"})
+                    else:
+                        raise BadRequest(f"morceau de message non pris en charge : {p.get('type')}")
+                c = parts
+            elif isinstance(c, list):
                 parts = []
                 for p in c:
                     if isinstance(p, str):
@@ -77,7 +184,7 @@ class Model:
                     elif p.get("type") in ("text", "input_text"):
                         parts.append(p.get("text") or "")
                     else:
-                        raise BadRequest("ce moteur ne lit que du texte (pas d'images ni d'audio)")
+                        raise BadRequest(f"morceau de message non pris en charge : {p.get('type')} (ce moteur lit le texte et les images)")
                 c = "".join(parts)
             out["content"] = c if c is not None else ""
             if m.get("reasoning_content"):
@@ -113,18 +220,22 @@ class Model:
                 raise BadRequest(f"reasoning_effort inconnu : {effort} (none, minimal, low, medium, high, xhigh, max)")
             kw["reasoning_effort"] = effort
         text = self.template.render(messages=messages, tools=req.get("tools") or None, add_generation_prompt=True, **kw)
-        return self.tok.encode(text, add_special_tokens=False).ids
+        ids = self.tok.encode(text, add_special_tokens=False).ids
+        if not images and self.image_id in ids:   # le texte d'un client ne doit pas ouvrir une place d'image
+            raise BadRequest(f"{IMAGE_TOKEN} est réservé aux images")
+        return ids, images
 
     # --- génération ---
-    def generate(self, req, ids, on_token, cancelled):
-        max_new = req.get("max_completion_tokens") or req.get("max_tokens") or self.ctx
-        max_new = max(1, min(int(max_new), self.ctx - len(ids)))
-        if len(ids) >= self.ctx:
-            raise BadRequest(f"prompt de {len(ids)} tokens, contexte {self.ctx}")
+    def generate(self, req, prompt, on_token, cancelled):
         kv = {"temperature": req.get("temperature", 1.0), "top_p": req.get("top_p"), "top_k": req.get("top_k"),
               "min_p": req.get("min_p"), "seed": req.get("seed")}
         args = " ".join(f"{k}={v}" for k, v in kv.items() if v is not None)
         with self.lock:
+            ids = self.expand(*prompt)
+            if len(ids) >= self.ctx:
+                raise BadRequest(f"prompt de {len(ids)} tokens, contexte {self.ctx}")
+            max_new = req.get("max_completion_tokens") or req.get("max_tokens") or self.ctx
+            max_new = max(1, min(int(max_new), self.ctx - len(ids)))
             self.proc.stdin.write(f"GEN {max_new} {args} {','.join(map(str, ids))}\n")
             self.proc.stdin.flush()
             stop_sent = False
@@ -247,7 +358,7 @@ def run(a):
                 return self._json(404, {"error": {"message": "inconnu"}})
             try:
                 req = json.loads(self.rfile.read(int(self.headers.get("Content-Length", 0))) or b"{}")
-                ids = model.prompt(req)
+                prompt = model.prompt(req)
             except (BadRequest, json.JSONDecodeError, jinja2.TemplateError) as e:
                 return self._json(400, {"error": {"message": str(e), "type": "invalid_request_error"}})
             stream, rid, created = bool(req.get("stream")), "chatcmpl-" + uuid.uuid4().hex[:24], int(time.time())
@@ -294,7 +405,7 @@ def run(a):
                 self.close_connection = True
                 chunk({"role": "assistant", "content": ""})
             try:
-                st = model.generate(req, ids, on_token, lambda: gone[0])
+                st = model.generate(req, prompt, on_token, lambda: gone[0])
             except BadRequest as e:
                 if stream:
                     chunk({}, "error")
@@ -342,4 +453,7 @@ if __name__ == "__main__":
     p.add_argument("--spec", action="store_true")
     p.add_argument("--api-key-file")
     p.add_argument("--alias", default="inkling-2-mini")
+    p.add_argument("--vision", help="build/inkling2-vision : l'encodeur d'image")
+    p.add_argument("--mmproj", help="poids/mmproj-BF16.gguf (unsloth/Inkling-2-Mini-GGUF)")
+    p.add_argument("--image-max-tokens", type=int, help="plafond de vecteurs par image (par défaut : celui du mmproj)")
     run(p.parse_args())

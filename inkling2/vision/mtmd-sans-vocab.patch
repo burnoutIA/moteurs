@@ -1,0 +1,14 @@
+diff --git a/tools/mtmd/mtmd.cpp b/tools/mtmd/mtmd.cpp
+index fdac762ac..b638c6b00 100644
+--- a/tools/mtmd/mtmd.cpp
++++ b/tools/mtmd/mtmd.cpp
+@@ -1889,7 +1889,8 @@ struct mtmd_tokenizer {
+ 
+     void add_text(const std::string & txt, bool parse_special) {
+         if (vocab == nullptr) {
+-            throw std::runtime_error("llama_vocab is not provided");
++            // encoder only (no text model): the caller places the media rows itself, the markers are skipped
++            return;
+         }
+         LOG_DBG("%s: %s\n", __func__, txt.c_str());
+         auto tokens = mtmd_tokenize_text_internal(vocab, txt, /* add_special */ false, parse_special);

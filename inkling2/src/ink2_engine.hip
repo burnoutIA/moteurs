@@ -2379,8 +2379,18 @@ void layer_forward(int l, Slot& S, int nB, const float* msgs) {
     if (l % BLOCK == 0) copy(stack_h, E.h, H);   // B gets the layer's input (the caller counts it)
 }
 
+// Images (vision/inkling2-vision): the projected rows of an image stand in for its <|unused_200054|> token.  "IMG F"
+// loads them here and answers the ids IMG_BASE + k, beyond the vocabulary: the prompt carries those ids, so the
+// prompt cache tells two images apart.  These rows skip embed_norm, as in llama.cpp (inkling2.cpp, build_inputs).
+constexpr int IMG_BASE = 1 << 24;
+std::vector<float> g_img;   // [rows][H]
+inline bool is_img(int tok) { return tok >= IMG_BASE; }
+inline size_t img_rows() { return g_img.size() / H; }
+std::vector<std::pair<int, int>> g_raw;   // forward_prefill -> forward_prefill_device: runs of image rows (start, n)
+
 // the token's embedding row (host table) into E.emb_in
 void upload_embed(int tok) {
+    if (is_img(tok)) { std::fprintf(stderr, "image row %d on the one-token path\n", tok - IMG_BASE); std::abort(); }
     vec e(H);
     for (int i = 0; i < H; ++i) {
         uint32_t u = (uint32_t) E.embed[(size_t) tok * H + i] << 16;
@@ -3262,13 +3272,21 @@ void forward_prefill(const int* toks, int T, int pos0, float* all) {
             for (int e = 0; e < NE; ++e) if (!t[(size_t) l * NE + e]) PF.nonres[l].push_back(e);
         }
     }
+    g_raw.clear();
     {
         vec e(ES);
-        for (int t = 0; t < T; ++t)
+        for (int t = 0; t < T; ++t) {
+            if (is_img(toks[t])) {
+                std::memcpy(&e[(size_t) t * H], &g_img[(size_t) (toks[t] - IMG_BASE) * H], (size_t) H * 4);
+                if (!g_raw.empty() && g_raw.back().first + g_raw.back().second == t) ++g_raw.back().second;
+                else g_raw.push_back({t, 1});
+                continue;
+            }
             for (int i = 0; i < H; ++i) {
                 uint32_t u = (uint32_t) E.embed[(size_t) toks[t] * H + i] << 16;
                 std::memcpy(&e[(size_t) t * H + i], &u, 4);
             }
+        }
         CK(hipMemcpyAsync(PF.x0, e.data(), ES * 4, hipMemcpyHostToDevice, hipStreamPerThread));
         CK(hipStreamSynchronize(hipStreamPerThread));
     }
@@ -3294,6 +3312,10 @@ void forward_prefill(const int* toks, int T, int pos0, float* all) {
 void forward_prefill_device(int T, int pos0, float* all) {
     const size_t ES = (size_t) T * H;
     k_rms<<<T, 512>>>(PF.x0, E.embed_norm, PF.h, H);
+    if (pos0 >= 0)   // image rows, as they came (never in the captured verify block: it only holds generated tokens)
+        for (const auto& r : g_raw)
+            CK(hipMemcpyAsync(PF.h + (size_t) r.first * H, PF.x0 + (size_t) r.first * H, (size_t) r.second * H * 4,
+                              hipMemcpyDeviceToDevice, hipStreamPerThread));
     int nB = 0, visit = 0;
     auto run = [&](int l, int slot, const float* msgs) {
         g_slot = slot;
@@ -3655,6 +3677,35 @@ int main(int argc, char** argv) {
                 q.pop_front();
             }
             if (line == "QUIT") break;
+            if (line.rfind("IMG ", 0) == 0) {   // IMG <file from inkling2-vision>  ->  IMG <first id> <rows>
+                const std::string path = line.substr(4);
+                FILE* fi = std::fopen(path.c_str(), "rb");
+                char magic[4] = {};
+                int32_t head[2] = {0, 0};
+                const bool ok = fi && std::fread(magic, 1, 4, fi) == 4 && std::memcmp(magic, "INKV", 4) == 0 &&
+                                std::fread(head, 4, 2, fi) == 2 && head[0] > 0 && head[1] == H;
+                if (!ok) std::printf("ERR image rows unreadable (INKV, dimension %d): %s\n", H, path.c_str());
+                else if (img_rows() + head[0] > (size_t) (INT32_MAX - IMG_BASE)) std::printf("ERR too many image rows, send IMGRESET\n");
+                else {
+                    const size_t first = img_rows();
+                    g_img.resize((first + head[0]) * H);
+                    if (std::fread(&g_img[first * H], 4, (size_t) head[0] * H, fi) != (size_t) head[0] * H) {
+                        g_img.resize(first * H);
+                        std::printf("ERR image rows truncated: %s\n", path.c_str());
+                    } else std::printf("IMG %d %d\n", IMG_BASE + (int) first, head[0]);
+                }
+                if (fi) std::fclose(fi);
+                std::fflush(stdout);
+                continue;
+            }
+            if (line == "IMGRESET") {   // forget every image: their ids are given out again, so the cache goes too
+                g_img.clear();
+                g_img.shrink_to_fit();
+                hist.clear();
+                std::printf("IMGRESET\n");
+                std::fflush(stdout);
+                continue;
+            }
             if (line.rfind("GEN ", 0) != 0) { std::printf("ERR unsupported command\n"); std::fflush(stdout); continue; }
             stop.store(false);
             std::vector<std::string> f;
@@ -3680,6 +3731,15 @@ int main(int argc, char** argv) {
                 else if (key == "seed") s.rng.seed(std::strtoull(val.c_str(), nullptr, 10));
             }
             if (pr.empty()) { std::printf("ERR empty prompt\n"); std::fflush(stdout); smp.rng = std::move(s.rng); continue; }
+            const auto bad = std::find_if(pr.begin(), pr.end(), [](int t) {
+                return t < 0 || (t >= VOCAB_ROWS && (!is_img(t) || (size_t) (t - IMG_BASE) >= img_rows()));
+            });
+            if (bad != pr.end() || is_img(pr.back())) {
+                std::printf("ERR token %d unknown (vocabulary, or an image row never loaded by IMG)\n", *(bad != pr.end() ? bad : pr.end() - 1));
+                std::fflush(stdout);
+                smp.rng = std::move(s.rng);
+                continue;
+            }
             if ((int) pr.size() >= E.ctx) {
                 std::printf("ERR prompt of %zu tokens exceeds the context %d\n", pr.size(), E.ctx);
                 std::fflush(stdout);

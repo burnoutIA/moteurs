@@ -1,6 +1,6 @@
 # Inkling 2 Mini sur R9700 : fiche du moteur sur mesure
 
-Dernière mise à jour : 21 novembre 2026. État : **portage HIP validé, servi en API OpenAI** (~67 tok/s contre 33 ; 131k de contexte dans 21,4 Gio). Reste : branchement dans Harn, préremplissage.
+Dernière mise à jour : 24 novembre 2026. État : **portage HIP validé, servi en API OpenAI, avec la vision** (~67 tok/s contre 33 ; 131k de contexte dans 21,4 Gio). Reste : le préremplissage.
 
 ## Sources
 
@@ -150,13 +150,56 @@ logits complets ne sortent que par le chemin token par token (`--chunk 0`).
 - Une requête à la fois, puisque le moteur n'a qu'un fil. Le cache du prompt est gardé quand la
   conversation prolonge la précédente : dans une boucle d'agent, seul le nouveau tour est
   préchargé (200 tokens en 310 ms, mesuré).
-- Pas d'images : le moteur n'a pas la vision, et la façade répond 400.
+- Images : voir « La vision » plus bas. Sans `--vision` et `--mmproj`, la façade répond 400.
 
 Essais du 21/11, tous réussis : une question simple (raisonnement séparé, réponse juste) ; un
 appel d'outil `read_file` aux arguments propres ; le résultat de l'outil réinjecté, puis une
 réponse juste ; un flux SSE (premier delta en 0,35 s, 64,2 tok/s) ; une coupure du client suivie
 d'une nouvelle requête servie normalement. À noter : avec `max_tokens` petit, la réponse peut
 rester vide, parce que même `none` réfléchit un peu avant de répondre.
+
+## La vision (24/11)
+
+Le modèle voit : le checkpoint officiel contient l'encodeur (`model.visual.*`, 422 tenseurs : un
+ViT de 23 couches en 1 024, RoPE 2D, puis une fusion 2 x 2 des carrés de 20 px et un projecteur
+vers 2 304). `strata-ink2` ne l'a jamais codé. Plutôt que de l'écrire, on prend celui de
+llama.cpp (#32217, « Inkling 2 support (text + vision) », dans master depuis le 14/11, pas dans
+la v1.0.0) : l'encodeur ne tourne qu'une fois par image, sa vitesse compte peu.
+
+| Pièce | Rôle |
+|---|---|
+| `vision/inkling2-vision.cpp` | l'encodeur seul, sur la `libmtmd` de llama.cpp, avec `poids/mmproj-BF16.gguf` (Unsloth, 0,64 Go) : une image donne N vecteurs de 2 304, écrits dans un fichier `INKV` |
+| `vision/mtmd-sans-vocab.patch` | une ligne : sans modèle de texte, mtmd n'a pas de vocabulaire et refusait d'ajouter son marqueur `<\|content_image\|>` autour de l'image ; il l'ignore désormais (le gabarit l'a déjà mis) |
+| `build-vision.sh` | llama.cpp figé à `c74c71a6f7`, le correctif, la seule cible `mtmd` en HIP, puis l'outil |
+| moteur, `IMG <fichier>` | charge les vecteurs et répond `IMG <premier id> <N>` : des ids à partir de 2^24, hors du vocabulaire ; `IMGRESET` les oublie (et vide le cache) |
+| moteur, préremplissage | un id d'image prend son vecteur tel quel, **sans `embed_norm`**, comme llama.cpp (`inkling2.cpp`, `build_inputs`) ; positions et attention causale inchangées |
+| façade | le gabarit officiel met `<\|content_image\|><\|unused_200054\|><\|end_message\|>` par image ; le token 200054 est remplacé par les N ids. Une image déjà vue (SHA-256) garde ses ids, donc le cache du prompt la reconnaît. URL `data:` seulement |
+
+Un vecteur par carré de 40 x 40 px : 640 x 488 donne 208 vecteurs, encodés en ~0,6 s (chargement
+compris, en ligne de commande). Le plafond de pixels du mmproj réduit les grandes images ;
+`--image-max-tokens` le baisse.
+
+Essais du 24/11 (glouton, effort `none`) :
+- image fabriquée (carré rouge à gauche, disque vert à droite, fond blanc) : décrite exactement,
+  avec et sans `--spec`, mot pour mot la même réponse ;
+- `test-1.jpeg` de llama.cpp : la une du New York Times du 20 juillet 1969, titre et sous-titre
+  recopiés juste ; le petit texte des colonnes, illisible à cette taille, le modèle le dit ;
+- deux images dans un message, une conversation à plusieurs tours sur une image : justes ;
+- décodage inchangé : 63-69 tok/s.
+
+Sur NVIDIA : `build-cuda.sh` copie la source d'origine dans `build/` et y applique
+`vision/ink2-images-cuda.patch` (les mêmes changements, en CUDA). `amont/` reste inchangé.
+L'encodeur y tourne sur le processeur (`VISION_BACKEND=cpu`) : à 131k le moteur prend 21,4 Gio
+sur 24, il ne reste pas de quoi encoder une grande image sur la carte. RTX 3090 (PC à 32 fils),
+le 24/11 : mêmes réponses justes qu'en HIP, décodage 93-96 tok/s, mémoire de la carte inchangée
+(22,8 Go) ; 640 x 488 encodé en 0,85 s ; 2000 x 2000 en 20 s (2 500 vecteurs), 5 s plafonné à
+1 024 (`--image-max-tokens 1024`, ce que Harn passe sur NVIDIA).
+
+`build-vision.sh` marche sans réseau : il prend `build/llama.cpp` tel quel s'il y est (l'archive
+GitHub du commit, extraite d'avance), ce que fait Harn avant de compiler dans sa bulle.
+
+Pas encore fait : comparer nos logits à ceux de llama.cpp avec le même mmproj sur une image (il
+faut un GGUF du texte, qu'on n'a plus) ; le WebP (llama.cpp le lit par ffmpeg).
 
 ## Plan
 
@@ -200,6 +243,10 @@ rester vide, parce que même `none` réfléchit un peu avant de répondre.
 - **21/11, soir** : validation contre llama.cpp (divergences toutes sur des quasi-égalités) ;
   façade OpenAI écrite et testée (outils, flux, coupure) ; 131k de contexte dans 21,4 Gio, à
   ~67 tok/s.
+- **24/11** : la vision, par l'encodeur de llama.cpp et des ids d'image dans le moteur (voir « La vision »),
+  en HIP et en CUDA (3090 essayée). Piège corrigé dans `telecharger-poids.mjs` : les petits fichiers hors LFS
+  arrivent en gzip, sans taille ; une reprise sur un fichier complet recevait un 416 et écrivait son texte à la
+  place du fichier (le gabarit en est mort, et avec lui celui de Harn, lié physiquement).
 - **21/11, 17 h** : installé par Harn (fiche `inkling-2-mini-ink2`, compilé dans la bulle en
   ~10 s). Banc Harn : **64,2 tok/s** (code 63,8, texte 65,4), 57,4 à ~35k de contexte,
   préremplissage à 574 tok/s. Avec le drafter (`--spec`), 59,2 : il coûte plus qu'il ne
